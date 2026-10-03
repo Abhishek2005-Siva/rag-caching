@@ -80,24 +80,54 @@ class KnowledgeGraph:
     def __init__(self):
         self.edges: dict[str, list[tuple[str, str, str]]] = {}
         self.skipped: list[tuple[str, str]] = []  # (chunk_id, reason) for chunks that failed
+        self.aborted: str | None = None           # set when the build was stopped early
 
     def add_triple(self, subject: str, relation: str, obj: str, chunk_id: str):
         subject, relation, obj = subject.strip(), relation.strip(), obj.strip()
         self.edges.setdefault(subject, []).append((relation, obj, chunk_id))
         self.edges.setdefault(obj, []).append((f"<- {relation}", subject, chunk_id))
 
+    # Chunks are independent, so extract several at once. Free-tier APIs tolerate a few parallel
+    # calls; more just trips rate limits.
+    MAX_WORKERS = 4
+    # If this many chunks fail and none has succeeded, the model or key is the problem
+    # (too slow, unavailable...). Stop instead of waiting out every remaining chunk.
+    ABORT_AFTER_FAILURES = 3
+
     def build(self, documents: list[dict], base_url: str, api_keys: list[str], model: str, progress_cb=None):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         self.skipped = []
-        for i, doc in enumerate(documents):
-            try:
-                triples = extract_triples(doc["text"], base_url, api_keys, model)
-            except Exception as exc:  # noqa: BLE001 - one failed chunk should not abort the whole graph
-                self.skipped.append((doc["id"], str(exc)[:200]))
-                triples = []
-            for triple in triples:
-                self.add_triple(triple["subject"], triple["relation"], triple["object"], doc["id"])
-            if progress_cb:
-                progress_cb(i + 1, len(documents))
+        self.aborted = None
+        results: dict[int, list[dict]] = {}
+        done = failures = successes = 0
+        executor = ThreadPoolExecutor(max_workers=self.MAX_WORKERS)
+        try:
+            futures = {executor.submit(extract_triples, d["text"], base_url, api_keys, model): i
+                       for i, d in enumerate(documents)}
+            for future in as_completed(futures):
+                i = futures[future]
+                try:
+                    results[i] = future.result()
+                    successes += 1
+                except Exception as exc:  # noqa: BLE001 - one failed chunk should not abort the whole graph
+                    self.skipped.append((documents[i]["id"], str(exc)[:200]))
+                    failures += 1
+                    if successes == 0 and failures >= self.ABORT_AFTER_FAILURES:
+                        self.aborted = (f"The first {failures} chunks all failed (last error: {str(exc)[:160]}). "
+                                        "The model is probably too slow or unavailable for this key. "
+                                        "Click 'Find working models', or pick a faster chat model.")
+                        break
+                done += 1
+                if progress_cb:
+                    progress_cb(done, len(documents))
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+        if self.aborted:
+            return
+        for i in sorted(results):  # keep document order so output is deterministic
+            for triple in results[i]:
+                self.add_triple(triple["subject"], triple["relation"], triple["object"], documents[i]["id"])
 
     def matching_nodes(self, query: str) -> list[str]:
         """Which graph entities does the query mention? Simple case-insensitive

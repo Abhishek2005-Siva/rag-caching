@@ -12,6 +12,7 @@ even know it's there. That "wrap, don't rewrite" shape is how we'll add every
 later cache too.
 """
 import hashlib
+import re
 
 from .embedder import cosine
 
@@ -50,6 +51,29 @@ class CachedEmbedder:
                 f"({rate:.0f}% hit rate), {len(self.store)} vectors stored")
 
 
+# Words that carry no topic on their own: a paraphrase may add or drop them freely. Question words
+# like who/when/where/why/how are deliberately NOT here, because they change what is being asked.
+_FILLER = frozenset("""
+a an the of to in on at for with from by about as into
+my me i you your we our us it its this that these those there he she they him her them his hers their theirs
+is are was were be been being am do does did done have has had having
+what which tell show give list say find get know some any all please can could would should will
+and or also just really kindly
+""".split())
+
+
+def content_words(text: str) -> frozenset[str]:
+    """The topic words of a question: lowercase, no filler, plurals folded ("projects" == "project")."""
+    words = set()
+    for token in re.findall(r"[a-z0-9]+", text.lower()):
+        if token in _FILLER:
+            continue
+        if len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
+            token = token[:-1]
+        words.add(token)
+    return frozenset(words)
+
+
 class SemanticCache:
     """TECHNIQUE 3 -- SEMANTIC (approximate) CACHE.
 
@@ -79,37 +103,61 @@ class SemanticCache:
     stays fast as the cache grows to thousands/millions of entries.
     """
 
-    def __init__(self, threshold: float = 0.90):
+    def __init__(self, threshold: float = 0.90, require_word_coverage: bool = False):
         self.threshold = threshold
-        self.entries: list[dict] = []  # [{"vector", "text", "value"}]
+        # Embedding similarity cannot tell "projects" from "experience AND projects": the extra
+        # topic barely moves the vector, so a compound question can score above the threshold and be
+        # served an answer to only half of it. With require_word_coverage on, a cached answer is
+        # reused only if the new question adds no topic word the cached question lacked.
+        self.require_word_coverage = require_word_coverage
+        self.entries: list[dict] = []  # [{"vector", "text", "words", "value"}]
+        self.blocked = 0        # near-matches above the threshold that the word check rejected
+        self.last_blocked: dict | None = None  # details of the most recent rejection, for the UI
         self.exact_hits = 0     # best match's text is identical to the query
         self.semantic_hits = 0  # best match clears the threshold but text differs
         self.misses = 0
 
     def lookup(self, query_vec: list[float], query_text: str | None = None):
-        """Return (value, similarity, matched_text) on a hit, else (None, best_sim, None)."""
-        best_entry, best_sim = None, -1.0
-        for entry in self.entries:
-            sim = cosine(query_vec, entry["vector"])
-            if sim > best_sim:
-                best_entry, best_sim = entry, sim
+        """Return (value, similarity, matched_text) on a hit, else (None, best_sim, None).
 
-        if best_entry is not None and best_sim >= self.threshold:
-            if query_text is not None and query_text == best_entry["text"]:
+        After a miss, `last_blocked` says whether a near-match was rejected by the word check."""
+        self.last_blocked = None
+        scored = sorted(((cosine(query_vec, e["vector"]), e) for e in self.entries),
+                        key=lambda pair: pair[0], reverse=True)
+        best_sim = scored[0][0] if scored else -1.0
+        query_words = content_words(query_text) if query_text is not None else None
+
+        for sim, entry in scored:
+            if sim < self.threshold:
+                break
+            identical = query_text is not None and query_text == entry["text"]
+            if self.require_word_coverage and query_words is not None and not identical:
+                extra = query_words - entry["words"]
+                if extra:  # this question asks about something the cached one did not
+                    if self.last_blocked is None:
+                        self.last_blocked = {"matched_text": entry["text"], "similarity": sim,
+                                             "extra_words": sorted(extra)}
+                    continue  # a lower-ranked entry might still be a faithful paraphrase
+            if identical:
                 self.exact_hits += 1
             else:
                 self.semantic_hits += 1
-            return best_entry["value"], best_sim, best_entry["text"]
+            self.last_blocked = None
+            return entry["value"], sim, entry["text"]
 
+        if self.last_blocked is not None:
+            self.blocked += 1
         self.misses += 1
         return None, max(best_sim, 0.0), None
 
     def put(self, query_vec: list[float], query_text: str, value):
-        self.entries.append({"vector": query_vec, "text": query_text, "value": value})
+        self.entries.append({"vector": query_vec, "text": query_text,
+                             "words": content_words(query_text), "value": value})
 
     def stats(self) -> str:
         total = self.exact_hits + self.semantic_hits + self.misses
         rate = ((self.exact_hits + self.semantic_hits) / total * 100) if total else 0
         return (f"semantic cache: {self.exact_hits} exact hits, {self.semantic_hits} "
                 f"semantic hits, {self.misses} misses ({rate:.0f}% hit rate), "
-                f"{len(self.entries)} entries, threshold={self.threshold}")
+                f"{len(self.entries)} entries, threshold={self.threshold}"
+                + (f", {self.blocked} near-matches rejected" if self.blocked else ""))

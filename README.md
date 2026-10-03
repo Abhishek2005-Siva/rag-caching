@@ -10,7 +10,7 @@ The retrieval and caching code is plain Python with no vector database and no ML
 |---|---|---|
 | **Hybrid retrieval** | `rag/hybrid.py`, `rag/sparse.py` | Dense (meaning) plus sparse BM25 (keywords) search, merged with Reciprocal Rank Fusion so neither scoring scale dominates |
 | **Embedding cache** | `rag/cache.py` (`CachedEmbedder`) | Exact-match cache keyed by a hash of the text. Repeated text never calls the embedding model twice |
-| **Semantic cache** | `rag/cache.py` (`SemanticCache`) | Reuses an earlier answer when a new question is close enough in meaning. The similarity threshold is the whole product decision, so it is a slider |
+| **Semantic cache** | `rag/cache.py` (`SemanticCache`) | Reuses an earlier answer when a new question is close enough in meaning. The similarity threshold is the whole product decision, so it is a slider. **Strict matching** (on by default in the app) adds a guard: a cached answer is reused only if your question adds no topic words the earlier one lacked, so "what are my experience and projects?" is never served the answer to "what are my projects?" |
 | **GraphRAG-lite** | `rag/graph_rag.py` | The LLM extracts (subject, relation, object) facts from each chunk. At query time the app walks one hop from the entities in your question to recover facts split across chunks |
 
 ## The app
@@ -24,6 +24,8 @@ The retrieval and caching code is plain Python with no vector database and no ML
 
 For NVIDIA the model dropdowns are read live from NVIDIA's model list, because its hosted lineup changes often.
 Some catalog models aren't available to every key and answer `404`. If **Test key** fails that way, click **Find working models**: it tries candidates with your key and selects ones that actually respond. The error message includes the provider's own explanation.
+
+**Find working models** tests candidates with your key on a miniature fact-extraction task and picks the fastest one that returns valid JSON. Reasoning models are avoided when a plain one works, because they can take a minute per answer. Transient `503`/`429` errors are retried with backoff, and the knowledge graph is built four chunks at a time and stops early, with an explanation, if the first few all fail.
 
 **Your key stays in your browser session.** It is masked as you type and never stored.
 

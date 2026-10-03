@@ -117,26 +117,80 @@ PROBE_SECONDS = 60     # per role: stop looking after this long
 PROBE_TIMEOUT = 12     # a model that takes longer than this to answer a one-token call is skipped
 
 
+PROBE_PROMPT = ("Return ONLY a JSON array of facts, each an object with keys subject, relation and object, "
+                "for this text: Guy F. Cipriani resigned from the Board.")
+FAST_ENOUGH_SECONDS = 4  # stop searching once a model that returns valid JSON answers this quickly
+
+
+def probe_chat(base_url: str, key: str, model: str) -> tuple[str, float, str]:
+    """Run a miniature version of the real job (extract facts as JSON) and time it.
+
+    Returns (state, seconds, detail) where state is
+      "good"     the model returned a valid fact list,
+      "callable" the model answered but not usefully (empty, or not JSON: typical of reasoning
+                 models, which spend a small token budget thinking and say nothing),
+      "failed"   the call errored (404 not available to this key, 503 overloaded, timeout...)."""
+    started = time.monotonic()
+    try:
+        text = chat_complete(base_url, key, system="You are a precise information-extraction system.",
+                             user=PROBE_PROMPT, model=model, max_tokens=200, timeout=PROBE_TIMEOUT,
+                             retry_on_length=False, retries=1)
+    except Exception as exc:  # noqa: BLE001
+        return "failed", time.monotonic() - started, str(exc)
+    seconds = time.monotonic() - started
+    match = re.search(r"\[.*\]", text or "", re.DOTALL)
+    try:
+        facts = json.loads(match.group(0)) if match else []
+    except json.JSONDecodeError:
+        facts = []
+    good = isinstance(facts, list) and any(isinstance(f, dict) and "subject" in f for f in facts)
+    return ("good" if good else "callable"), seconds, text or "(empty reply)"
+
+
 def find_working_models(base_url: str, key: str, needs_input_type: bool,
                         chat_candidates: list[str], embed_candidates: list[str]) -> dict:
-    """Try candidate models with the visitor's own key and report which ones respond.
+    """Try candidate models with the visitor's own key and report which ones work well.
 
-    Catalog listings include models a given account cannot call (HTTP 404), and different
-    accounts can call different models, so the only reliable test is a real one-token request.
-    A model that 404s answers in milliseconds, so trying every candidate is cheap; the time
-    budget only guards against slow or cold models."""
-    report = {"embed": None, "chat": None, "failures": []}
-    for role, candidates in (("embed", embed_candidates), ("chat", chat_candidates)):
-        started = time.monotonic()
-        for model in candidates:
-            if time.monotonic() - started > PROBE_SECONDS:
-                report["failures"].append(f"{role}: stopped after {PROBE_SECONDS}s")
+    Catalog listings include models a given account cannot call (HTTP 404), different accounts
+    can call different models, and free endpoints are sometimes overloaded (503). So the only
+    reliable test is a real request. For chat the request is a miniature fact extraction, and the
+    fastest model that returns valid JSON wins: reasoning models can take a minute per answer,
+    which made knowledge-graph builds time out. A model that 404s answers in milliseconds, so
+    trying every candidate is cheap; the time budget only guards against slow or cold models."""
+    report = {"embed": None, "chat": None, "chat_quality": None, "chat_seconds": None, "failures": []}
+
+    started = time.monotonic()
+    for model in embed_candidates:
+        if time.monotonic() - started > PROBE_SECONDS:
+            report["failures"].append(f"embedding: stopped after {PROBE_SECONDS}s")
+            break
+        ok, message = test_key("embed", base_url, key, model, needs_input_type, timeout=PROBE_TIMEOUT)
+        if ok:
+            report["embed"] = model
+            break
+        report["failures"].append(f"embedding {model}: {message[:140]}")
+
+    started = time.monotonic()
+    good, callable_only = [], []  # (seconds, model)
+    for model in chat_candidates:
+        if time.monotonic() - started > PROBE_SECONDS or len(good) >= 3:
+            break
+        state, seconds, detail = probe_chat(base_url, key, model)
+        if state == "failed":
+            report["failures"].append(f"chat {model}: {detail[:140]}")
+        elif state == "good":
+            good.append((seconds, model))
+            if seconds <= FAST_ENOUGH_SECONDS:
                 break
-            ok, message = test_key(role, base_url, key, model, needs_input_type, timeout=PROBE_TIMEOUT)
-            if ok:
-                report[role] = model
-                break
-            report["failures"].append(f"{'embedding' if role == 'embed' else 'chat'} {model}: {message[:140]}")
+        else:
+            callable_only.append((seconds, model))
+            report["failures"].append(f"chat {model}: answered but not usefully ({seconds:.0f}s): {detail[:80]!r}")
+    if good:
+        seconds, report["chat"] = min(good)
+        report["chat_quality"], report["chat_seconds"] = "good", seconds
+    elif callable_only:
+        seconds, report["chat"] = min(callable_only)
+        report["chat_quality"], report["chat_seconds"] = "untested", seconds
     return report
 
 
@@ -195,6 +249,10 @@ def connection_picker():
         if report:
             if report["embed"] and report["chat"]:
                 st.success(f"Using {report['embed']} for embeddings and {report['chat']} for chat.")
+                if report["chat_quality"] == "untested":
+                    st.warning("That chat model responds but did not pass a small fact-extraction test "
+                               "(it may be a slow reasoning model), so answers and the knowledge graph may "
+                               "be slow or fail. No better model was available to this key right now.")
             else:
                 missing = [n for n, m in (("embedding", report["embed"]), ("chat", report["chat"])) if not m]
                 st.error("No working " + " or ".join(missing) + " model found for this key. "
@@ -226,6 +284,11 @@ with st.sidebar:
                "cached answer instead of recomputing. Lower = more hits, but risks "
                "matching a different question. See demo_02_semantic_cache.py for why.")
     sim_threshold = st.slider("Similarity threshold", 0.50, 0.99, 0.85, step=0.01)
+    strict_match = st.checkbox(
+        "Strict matching (recommended)", value=True,
+        help="Embedding similarity can't tell \"projects\" from \"experience and projects\", so a "
+             "compound question could be served half an answer. Strict matching only reuses a cached "
+             "answer if your question adds no topic words the earlier question lacked.")
 
     embed_ready = bool(base_url and embed_model and api_keys)
     ingest_disabled = not (embed_ready and uploaded)
@@ -247,7 +310,7 @@ with st.sidebar:
                 st.session_state.retriever = retriever
                 st.session_state.source_name = uploaded.name
                 st.session_state.history = []
-                st.session_state.semantic_cache = SemanticCache(threshold=sim_threshold)
+                st.session_state.semantic_cache = SemanticCache(threshold=sim_threshold, require_word_coverage=strict_match)
                 st.session_state.knowledge_graph = None  # must rebuild for the new document
                 st.success(f"Ingested {len(docs)} chunks from {uploaded.name}")
 
@@ -260,6 +323,7 @@ with st.sidebar:
     # Threshold can be tuned live without re-ingesting the PDF.
     if st.session_state.semantic_cache is not None:
         st.session_state.semantic_cache.threshold = sim_threshold
+        st.session_state.semantic_cache.require_word_coverage = strict_match
 
     # Chat config can also change live -- store the latest picks so the main
     # panel (ask flow, knowledge graph) always uses what's currently selected.
@@ -316,8 +380,11 @@ if st.button("Build knowledge graph", disabled=not chat_ready):
         kg.build(st.session_state.documents, chat_cfg["base_url"], chat_cfg["api_keys"],
                   chat_cfg["model"], progress_cb=_cb)
     progress.empty()
-    st.session_state.knowledge_graph = kg
-    st.success(kg.stats())
+    if kg.aborted:
+        st.error(kg.aborted)
+    else:
+        st.session_state.knowledge_graph = kg
+        st.success(kg.stats())
     if kg.skipped:
         with st.expander(f"{len(kg.skipped)} chunk(s) were skipped (the model errored on them)"):
             for chunk_id, reason in kg.skipped:
@@ -366,6 +433,7 @@ if ask and query:
     # tells us which: "exact" (identical text -> similarity ~1.0), "semantic"
     # (different text, but close enough to reuse), or "miss".
     cached_value, similarity, matched_text = cache.lookup(query_vec, query_text=query)
+    blocked = cache.last_blocked  # set when a near-match was rejected by strict matching
 
     if cached_value is not None:
         hit_kind = "exact" if matched_text == query else "semantic"
@@ -417,6 +485,7 @@ if ask and query:
         "graph_facts": graph_facts,
         "elapsed_ms": elapsed_ms,
         "hit_kind": hit_kind,        # "exact" | "semantic" | "miss"
+        "blocked": blocked,          # a near-match strict matching refused to reuse, or None
         "similarity": similarity,
         "matched_text": matched_text,
     })
@@ -443,6 +512,11 @@ for entry in st.session_state.history:
                   delta=f"⚙️ cache MISS (best similarity {entry['similarity']:.3f}) "
                         f"— computed fresh (embedding + retrieval + generation)",
                   delta_color="off")
+        if entry.get("blocked"):
+            b = entry["blocked"]
+            st.caption(f"A similar earlier question (*\"{b['matched_text']}\"*, similarity "
+                       f"{b['similarity']:.3f}) was not reused because yours also asks about: "
+                       f"**{', '.join(b['extra_words'])}**.")
 
     st.markdown(entry["answer"])
     if entry.get("graph_facts"):

@@ -23,11 +23,31 @@ def _check(resp: requests.Response) -> None:
         raise requests.HTTPError(f"{exc} | {detail}" if detail else str(exc), response=resp) from exc
 
 
+_TRANSIENT_STATUS = {429, 502, 503, 504}  # overloaded / rate-limited: worth a short wait and another try
+
+
+def _post(url: str, headers: dict, payload: dict, timeout: float, retries: int) -> requests.Response:
+    """POST, retrying a couple of times with backoff when the server is momentarily overloaded.
+
+    Free hosted endpoints answer 503 for a moment under load. Timeouts are NOT retried: a request
+    that already waited `timeout` seconds will not get faster."""
+    delay = 1.0
+    for attempt in range(retries + 1):
+        resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        if resp.status_code in _TRANSIENT_STATUS and attempt < retries:
+            time.sleep(delay)
+            delay *= 3
+            continue
+        return resp
+    return resp  # unreachable, keeps type checkers happy
+
+
 class OpenAICompatibleEmbedder:
     def __init__(self, base_url: str, api_key: str, model: str,
-                 input_type: str | None = None, timeout: float = 30):
+                 input_type: str | None = None, timeout: float = 30, retries: int = 2):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.retries = retries
         self.api_key = api_key
         self.model = model
         self.input_type = input_type  # only providers like NVIDIA use this
@@ -40,11 +60,10 @@ class OpenAICompatibleEmbedder:
         payload = {"input": [text], "model": self.model, "encoding_format": "float"}
         if self.input_type:
             payload["input_type"] = self.input_type
-        resp = requests.post(
+        resp = _post(
             f"{self.base_url}/embeddings",
-            headers={"Authorization": f"Bearer {self.api_key}", "Accept": "application/json"},
-            json=payload,
-            timeout=self.timeout,
+            {"Authorization": f"Bearer {self.api_key}", "Accept": "application/json"},
+            payload, self.timeout, self.retries,
         )
         _check(resp)
         self.last_latency_ms = (time.perf_counter() - start) * 1000
@@ -52,17 +71,19 @@ class OpenAICompatibleEmbedder:
 
 
 def chat_complete(base_url: str, api_key: str, system: str, user: str,
-                   model: str, max_tokens: int = 512, timeout: float = 60) -> str:
+                   model: str, max_tokens: int = 512, timeout: float = 60,
+                   retry_on_length: bool = True, retries: int = 2) -> str:
     """One chat call. Always returns a string (possibly empty), never None.
 
     Reasoning models can spend the whole token budget thinking and return `content: null` with
     finish_reason "length". In that case retry once with more room, instead of handing the
-    caller an empty answer."""
+    caller an empty answer. Set retry_on_length=False to see the raw behaviour (the model probe
+    uses this to tell reasoning models, which are slow, from plain ones)."""
     def call(tokens: int) -> tuple[str, str | None]:
-        resp = requests.post(
+        resp = _post(
             f"{base_url.rstrip('/')}/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}"},
-            json={
+            {"Authorization": f"Bearer {api_key}"},
+            {
                 "model": model,
                 "messages": [
                     {"role": "system", "content": system},
@@ -71,15 +92,15 @@ def chat_complete(base_url: str, api_key: str, system: str, user: str,
                 "max_tokens": tokens,
                 "temperature": 0.2,
             },
-            timeout=timeout,
+            timeout, retries,
         )
         _check(resp)
         choice = resp.json()["choices"][0]
         return (choice.get("message", {}).get("content") or ""), choice.get("finish_reason")
 
     text, finish = call(max_tokens)
-    if not text.strip() and finish == "length":
-        text, _ = call(min(max_tokens * 6, 4096))
+    if retry_on_length and not text.strip() and finish == "length":
+        text, _ = call(min(max_tokens * 3, 2048))
     return text
 
 
@@ -149,13 +170,13 @@ class MultiKeyEmbedder:
 
 
 def multi_key_chat_complete(base_url: str, keys: list[str], system: str, user: str,
-                             model: str, max_tokens: int = 512) -> str:
+                             model: str, max_tokens: int = 512, timeout: float = 60) -> str:
     """Same as chat_complete(), but rotates through `keys` on 401/403/429."""
     rotator = KeyRotator(keys)
     last_exc = None
     for _ in range(len(keys)):
         try:
-            return chat_complete(base_url, rotator.current(), system, user, model, max_tokens)
+            return chat_complete(base_url, rotator.current(), system, user, model, max_tokens, timeout)
         except requests.HTTPError as e:
             last_exc = e
             if _status_of(e) in _ROTATE_ON_STATUS:
