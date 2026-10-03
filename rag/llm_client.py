@@ -53,22 +53,34 @@ class OpenAICompatibleEmbedder:
 
 def chat_complete(base_url: str, api_key: str, system: str, user: str,
                    model: str, max_tokens: int = 512, timeout: float = 60) -> str:
-    resp = requests.post(
-        f"{base_url.rstrip('/')}/chat/completions",
-        headers={"Authorization": f"Bearer {api_key}"},
-        json={
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "max_tokens": max_tokens,
-            "temperature": 0.2,
-        },
-        timeout=timeout,
-    )
-    _check(resp)
-    return resp.json()["choices"][0]["message"]["content"]
+    """One chat call. Always returns a string (possibly empty), never None.
+
+    Reasoning models can spend the whole token budget thinking and return `content: null` with
+    finish_reason "length". In that case retry once with more room, instead of handing the
+    caller an empty answer."""
+    def call(tokens: int) -> tuple[str, str | None]:
+        resp = requests.post(
+            f"{base_url.rstrip('/')}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                "max_tokens": tokens,
+                "temperature": 0.2,
+            },
+            timeout=timeout,
+        )
+        _check(resp)
+        choice = resp.json()["choices"][0]
+        return (choice.get("message", {}).get("content") or ""), choice.get("finish_reason")
+
+    text, finish = call(max_tokens)
+    if not text.strip() and finish == "length":
+        text, _ = call(min(max_tokens * 6, 4096))
+    return text
 
 
 # ---------------------------------------------------------------------------

@@ -60,7 +60,7 @@ def extract_triples(text: str, base_url: str, api_keys: list[str], model: str) -
         max_tokens=600,
     )
     # Models sometimes wrap JSON in prose or ```json fences -- pull out the array.
-    match = re.search(r"\[.*\]", raw, re.DOTALL)
+    match = re.search(r"\[.*\]", raw or "", re.DOTALL)
     if not match:
         return []
     try:
@@ -79,6 +79,7 @@ class KnowledgeGraph:
 
     def __init__(self):
         self.edges: dict[str, list[tuple[str, str, str]]] = {}
+        self.skipped: list[tuple[str, str]] = []  # (chunk_id, reason) for chunks that failed
 
     def add_triple(self, subject: str, relation: str, obj: str, chunk_id: str):
         subject, relation, obj = subject.strip(), relation.strip(), obj.strip()
@@ -86,8 +87,14 @@ class KnowledgeGraph:
         self.edges.setdefault(obj, []).append((f"<- {relation}", subject, chunk_id))
 
     def build(self, documents: list[dict], base_url: str, api_keys: list[str], model: str, progress_cb=None):
+        self.skipped = []
         for i, doc in enumerate(documents):
-            for triple in extract_triples(doc["text"], base_url, api_keys, model):
+            try:
+                triples = extract_triples(doc["text"], base_url, api_keys, model)
+            except Exception as exc:  # noqa: BLE001 - one failed chunk should not abort the whole graph
+                self.skipped.append((doc["id"], str(exc)[:200]))
+                triples = []
+            for triple in triples:
                 self.add_triple(triple["subject"], triple["relation"], triple["object"], doc["id"])
             if progress_cb:
                 progress_cb(i + 1, len(documents))

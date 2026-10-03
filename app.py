@@ -87,9 +87,9 @@ _NON_CHAT = re.compile(
     r"deplot|fuyu|video|cosmos|ising|starcoder", re.I)
 _EMBEDDING = re.compile(r"embed", re.I)  # any embedding model; which ones a key can call differs per account
 _PREFERRED_CHAT = ["mistralai/mistral-large-2-instruct", "nvidia/llama-3.1-nemotron-70b-instruct",
-                   "nvidia/nemotron-nano-3-30b-a3b", "openai/gpt-oss-20b",
-                   "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning", "nvidia/nemotron-3-ultra-550b-a55b",
-                   "google/gemma-4-31b-it", "google/diffusiongemma-26b-a4b-it"]
+                   "nvidia/nemotron-nano-3-30b-a3b", "google/diffusiongemma-26b-a4b-it",
+                   "google/gemma-4-31b-it", "openai/gpt-oss-20b",
+                   "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning", "nvidia/nemotron-3-ultra-550b-a55b"]
 _PREFERRED_EMBED = ["nvidia/nemotron-3-embed-1b", "nvidia/nv-embedqa-mistral-7b-v2",
                     "nvidia/llama-3.2-nv-embedqa-1b-v1", "nvidia/llama-nemotron-embed-vl-1b-v2"]
 PROVIDER_CHOICES = ["NVIDIA (build.nvidia.com)", "OpenAI"]
@@ -318,6 +318,10 @@ if st.button("Build knowledge graph", disabled=not chat_ready):
     progress.empty()
     st.session_state.knowledge_graph = kg
     st.success(kg.stats())
+    if kg.skipped:
+        with st.expander(f"{len(kg.skipped)} chunk(s) were skipped (the model errored on them)"):
+            for chunk_id, reason in kg.skipped:
+                st.text(f"{chunk_id}: {reason}")
 
 if st.session_state.knowledge_graph is not None:
     kg = st.session_state.knowledge_graph
