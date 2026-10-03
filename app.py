@@ -1,13 +1,16 @@
 """Streamlit UI: upload a PDF, ask questions, see the embedding-cache speedup.
 
-Works against any OpenAI-compatible API -- NVIDIA NIM (free), OpenAI,
-Together AI, Mistral, Groq (chat only), a local Ollama server, or a Custom
-base URL. Pick the embedding provider and the chat/generation provider
-independently in the sidebar (they don't have to be the same one).
+Works with NVIDIA's free hosted models or OpenAI. Pick one provider in the
+sidebar and paste ONE API key: it is used for both embeddings and chat.
+(rag/providers.py also lists other OpenAI-compatible providers; the UI offers
+the two most common.)
 
 Run:  .venv/bin/streamlit run app.py
 """
+import json
+import re
 import time
+import urllib.request
 
 import streamlit as st
 
@@ -18,7 +21,7 @@ from rag.llm_client import (
     OpenAICompatibleEmbedder, chat_complete, MultiKeyEmbedder, multi_key_chat_complete,
 )
 from rag.pdf_utils import pdf_to_documents
-from rag.providers import PROVIDERS, EMBEDDING_PROVIDERS, CHAT_PROVIDERS
+from rag.providers import PROVIDERS
 
 st.set_page_config(page_title="RAG Caching Demo", page_icon="📄", layout="wide")
 
@@ -34,8 +37,6 @@ defaults = {
     "semantic_cache": None,   # SemanticCache: query embedding -> {"answer", "chunks"}
     "knowledge_graph": None,  # KnowledgeGraph, built lazily via a separate button (costs 1 LLM call/chunk)
     "chat_config": None,      # {"base_url", "api_keys", "model"} snapshot used at ingest time
-    "failed_providers": {"embed": set(), "chat": set()},  # provider names excluded (every key failed)
-    "valid_keys": {},         # (role, provider_name) -> list[str] of keys that passed their test
 }
 for k, v in defaults.items():
     st.session_state.setdefault(k, v)
@@ -77,148 +78,96 @@ def test_key(role: str, base_url: str, api_key: str, model: str, needs_input_typ
         return False, str(e)
 
 
-def _mask(key: str) -> str:
-    return f"{key[:6]}...{key[-4:]}" if len(key) > 12 else key
+# NVIDIA's hosted lineup changes often (models get retired without notice), so read the live list.
+NVIDIA_MODELS_URL = "https://integrate.api.nvidia.com/v1/models"
+_NON_CHAT = re.compile(
+    r"embed|rerank|safety|guard|reward|parse|vlm|vision|clip|retriev|riva|neva|vila|kosmos|"
+    r"deplot|fuyu|video|cosmos|ising|starcoder", re.I)
+_EMBEDDING = re.compile(r"embedqa|embed-qa|arctic-embed", re.I)       # models that take input_type
+_NOT_TEXT_EMBEDDING = re.compile(r"vlm|vl-|-vl", re.I)
+_PREFERRED_CHAT = ["mistralai/mistral-large-2-instruct", "nvidia/llama-3.1-nemotron-70b-instruct",
+                   "nvidia/nemotron-nano-3-30b-a3b", "openai/gpt-oss-20b"]
+_PREFERRED_EMBED = ["nvidia/nv-embedqa-mistral-7b-v2", "nvidia/llama-3.2-nv-embedqa-1b-v1"]
+PROVIDER_CHOICES = ["NVIDIA (build.nvidia.com)", "OpenAI"]
 
 
-def provider_picker(label_prefix: str, provider_names: list[str], role: str):
-    """Render a provider dropdown + base URL / model / API key(s) inputs, plus
-    a 'Test' button. Multiple keys (one per line) are supported for the SAME
-    provider -- e.g. several free NVIDIA accounts -- and the app rotates
-    across them at request time on rate limits (MultiKeyEmbedder /
-    multi_key_chat_complete). Testing checks each key individually; a key
-    that fails is dropped from what's actually used. If EVERY key for a
-    provider fails, the provider itself is removed from the dropdown until
-    you reset it.
+@st.cache_data(ttl=1800, show_spinner=False)
+def nvidia_models() -> tuple[list[str], list[str]]:
+    """(chat models, embedding models) NVIDIA serves right now, preferred ones first."""
+    try:
+        with urllib.request.urlopen(NVIDIA_MODELS_URL, timeout=8) as resp:
+            ids = [m["id"] for m in json.load(resp)["data"]]
+        chat = [i for i in ids if not _NON_CHAT.search(i)]
+        embed = [i for i in ids if _EMBEDDING.search(i) and not _NOT_TEXT_EMBEDDING.search(i)]
 
-    Returns (base_url, api_keys: list[str], model, needs_input_type) for
-    whichever provider/settings the user currently has selected."""
-    failed = st.session_state.failed_providers[role]
-    available = [p for p in provider_names if p not in failed]
-    if not available:
-        st.error(f"All {label_prefix.lower()} providers are excluded (every key failed). "
-                 f"Reset below to try again.")
-        available = provider_names  # fall back so the UI doesn't dead-end
+        def order(found, preferred):
+            first = [m for m in preferred if m in found]
+            return (first + [i for i in found if i not in first]) or list(preferred)
 
-    provider_name = st.selectbox(f"{label_prefix} provider", available, key=f"{role}_provider")
+        return order(chat, _PREFERRED_CHAT), order(embed, _PREFERRED_EMBED)
+    except Exception:  # noqa: BLE001 - offline or endpoint changed
+        return list(_PREFERRED_CHAT), list(_PREFERRED_EMBED)
+
+
+def connection_picker():
+    """One provider, one masked API key, used for BOTH embeddings and chat.
+
+    Returns (base_url, api_keys, embed_model, chat_model, needs_input_type). `api_keys` is a list
+    of at most one key because the rotation helpers in rag/llm_client.py take a list."""
+    provider_name = st.selectbox("Provider", PROVIDER_CHOICES)
     cfg = PROVIDERS[provider_name]
+    base_url = cfg["base_url"]
 
-    if provider_name == "Custom (OpenAI-compatible)":
-        base_url = st.text_input(f"{label_prefix} base URL", placeholder="https://.../v1",
-                                  key=f"{role}_base_url")
+    key = st.text_input(
+        "API key", type="password", placeholder=cfg["key_placeholder"],
+        help="One key for both embeddings and chat. Used only in this browser session; never stored.",
+    ).strip()
+    if cfg["signup_url"]:
+        st.caption(f"Get a free key: {cfg['signup_url']}")
+    api_keys = [key] if key else []
+
+    if provider_name.startswith("NVIDIA"):
+        chat_models, embed_models = nvidia_models()
+        embed_model = st.selectbox("Embedding model", embed_models)
+        chat_model = st.selectbox("Chat model", chat_models)
     else:
-        base_url = cfg["base_url"]
-        st.caption(f"Base URL: `{base_url}`")
+        embed_model = st.text_input("Embedding model", value=cfg["default_embed_model"])
+        chat_model = st.text_input("Chat model", value=cfg["default_chat_model"])
 
-    model = st.text_input(f"{label_prefix} model", value=cfg["default_embed_model"]
-                           if label_prefix == "Embedding" else cfg["default_chat_model"],
-                           key=f"{role}_model")
-
-    if provider_name == "Ollama (local, no key)":
-        api_keys = ["ollama"]  # Ollama ignores the value but the header still needs to be sent
-        st.caption("No API key needed for a local Ollama server.")
-    else:
-        # The first key is masked. Extra keys (to pool free accounts) go in a text area, which
-        # Streamlit cannot mask, so it is tucked away and optional.
-        primary_key = st.text_input(
-            f"{label_prefix} API key", type="password", placeholder=cfg["key_placeholder"],
-            key=f"{role}_key_primary",
-        ).strip()
-        with st.expander("Pool more keys (optional)"):
-            extra_raw = st.text_area(
-                "Extra keys, one per line", height=70,
-                help="Keys from other free accounts for the same provider. The app rotates to "
-                     "the next one on rate limits. Note: this box is not masked.",
-                key=f"{role}_keys_extra",
-            )
-        extras = [line.strip() for line in extra_raw.splitlines() if line.strip()]
-        api_keys = list(dict.fromkeys(([primary_key] if primary_key else []) + extras))
-        if cfg["signup_url"]:
-            st.caption(f"Get a free key: {cfg['signup_url']}")
-        if provider_name.startswith("NVIDIA"):
-            st.caption("NVIDIA retires hosted models without notice. If a test returns 410 (Gone), "
-                       "pick a current model at build.nvidia.com/models.")
-
-        # If this exact provider was already tested, use only the keys that
-        # passed -- silently pruning ones the user typed in but that don't
-        # work, per your earlier request.
-        validated = st.session_state.valid_keys.get((role, provider_name))
-        if validated is not None:
-            still_present = [k for k in validated if k in api_keys]
-            if still_present:
-                api_keys = still_present
-
-    ready = bool(base_url and model and api_keys)
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        if st.button(f"Test {label_prefix.lower()} key(s)", key=f"{role}_test", disabled=not ready):
-            results = []
-            with st.spinner(f"Testing {len(api_keys)} key(s) against {provider_name}..."):
-                for key in api_keys:
-                    ok, message = test_key(role, base_url, key, model, cfg["needs_input_type"])
-                    results.append((key, ok, message))
-            for key, ok, message in results:
+    needs_input_type = cfg["needs_input_type"]
+    if st.button("Test key", disabled=not (api_keys and embed_model and chat_model)):
+        with st.spinner("Testing embeddings and chat..."):
+            for role, label, model in (("embed", "Embeddings", embed_model), ("chat", "Chat", chat_model)):
+                ok, message = test_key(role, base_url, key, model, needs_input_type)
                 if ok:
-                    st.success(f"✅ {_mask(key)} works")
+                    st.success(f"✅ {label} work")
                 else:
-                    st.error(f"❌ {_mask(key)} failed: {message}")
-
-            working = [k for k, ok, _ in results if ok]
-            if working:
-                st.session_state.valid_keys[(role, provider_name)] = working
-                if len(working) < len(api_keys):
-                    st.warning(f"{len(api_keys) - len(working)} key(s) removed; "
-                               f"{len(working)} still in use.")
-            else:
-                st.session_state.failed_providers[role].add(provider_name)
-                st.error(f"{provider_name} failed and was removed from the list "
-                         f"(no working keys).")
-            st.rerun()
-    with col2:
-        if failed and st.button("↺ Reset", key=f"{role}_reset",
-                                 help="Bring back excluded providers for this role"):
-            st.session_state.failed_providers[role] = set()
-            st.rerun()
-
-    if failed:
-        st.caption(f"Excluded (no working keys): {', '.join(sorted(failed))}")
-    if len(api_keys) > 1:
-        st.caption(f"{len(api_keys)} keys pooled for {provider_name} -- rotates on rate limits.")
-
-    return base_url, api_keys, model, cfg["needs_input_type"]
+                    st.error(f"❌ {label} failed: {message}")
+    return base_url, api_keys, embed_model, chat_model, needs_input_type
 
 
 # ---------------------------------------------------------------------------
 # Sidebar: provider selection + PDF upload
 # ---------------------------------------------------------------------------
 with st.sidebar:
-    st.header("1. Embedding API")
-    st.caption("Add more than one key (one per line) to pool multiple free accounts -- "
-               "e.g. several NVIDIA NIM keys -- so ingestion rotates to the next key "
-               "instead of stalling on one key's rate limit.")
-    embed_base_url, embed_api_keys, embed_model, embed_needs_input_type = provider_picker(
-        "Embedding", EMBEDDING_PROVIDERS, "embed")
+    st.header("1. Provider and API key")
+    st.caption("One key does everything: it embeds your document and answers your questions. "
+               "NVIDIA's models are free; OpenAI needs a paid key.")
+    base_url, api_keys, embed_model, chat_model, embed_needs_input_type = connection_picker()
 
     st.divider()
-    st.header("2. Chat / generation API")
-    st.caption("Can be a different provider than embeddings -- e.g. embed with NVIDIA, "
-               "generate with Groq. Also supports multiple pooled keys.")
-    chat_base_url, chat_api_keys, chat_model, _ = provider_picker(
-        "Chat", CHAT_PROVIDERS, "chat")
-
-    st.divider()
-    st.header("3. Upload a PDF")
+    st.header("2. Upload a PDF")
     uploaded = st.file_uploader("PDF file", type=["pdf"])
     chunk_size = st.slider("Chunk size (chars)", 300, 2000, 800, step=100)
     overlap = st.slider("Chunk overlap (chars)", 0, 400, 150, step=50)
 
-    st.header("4. Semantic cache")
+    st.header("3. Semantic cache")
     st.caption("Minimum cosine similarity to an earlier question before we reuse its "
                "cached answer instead of recomputing. Lower = more hits, but risks "
                "matching a different question. See demo_02_semantic_cache.py for why.")
     sim_threshold = st.slider("Similarity threshold", 0.50, 0.99, 0.85, step=0.01)
 
-    embed_ready = bool(embed_base_url and embed_model and embed_api_keys)
+    embed_ready = bool(base_url and embed_model and api_keys)
     ingest_disabled = not (embed_ready and uploaded)
     if st.button("Ingest PDF", disabled=ingest_disabled, type="primary"):
         with st.spinner("Extracting and chunking PDF..."):
@@ -229,7 +178,7 @@ with st.sidebar:
         else:
             try:
                 embedder, retriever = build_index(
-                    embed_base_url, embed_api_keys, embed_model, embed_needs_input_type, docs)
+                    base_url, api_keys, embed_model, embed_needs_input_type, docs)
             except Exception as e:
                 st.error(f"Embedding API error: {e}")
             else:
@@ -255,7 +204,7 @@ with st.sidebar:
     # Chat config can also change live -- store the latest picks so the main
     # panel (ask flow, knowledge graph) always uses what's currently selected.
     st.session_state.chat_config = {
-        "base_url": chat_base_url, "api_keys": chat_api_keys, "model": chat_model,
+        "base_url": base_url, "api_keys": api_keys, "model": chat_model,
     }
 
 # ---------------------------------------------------------------------------
@@ -267,7 +216,7 @@ st.caption("Retrieval-augmented Q&A over your PDF, against any OpenAI-compatible
            "paraphrase) and watch the answer come back nearly free.")
 
 if not st.session_state.retriever:
-    st.info("⬅️ Pick your embedding provider and ingest a PDF to get started.")
+    st.info("⬅️ Enter your API key, upload a PDF and click Ingest to get started.")
     st.stop()
 
 chat_cfg = st.session_state.chat_config

@@ -17,16 +17,16 @@ The retrieval and caching code is plain Python with no vector database and no ML
 
 `app.py` is a Streamlit app. In the sidebar you:
 
-1. Pick an **embedding** provider and key.
-2. Pick a **chat** provider and key. It can differ from the embedding one, for example embed with NVIDIA and answer with Groq.
-3. Upload a PDF and set chunk size, overlap and the semantic-cache threshold.
-4. Ingest, then ask questions. Each answer shows its time, whether it came from a cache, and the retrieved chunks.
+1. Pick a **provider**, either NVIDIA (free key) or OpenAI, and paste **one API key**. That single key is used for both embeddings and chat.
+2. Upload a PDF and set chunk size, overlap and the semantic-cache threshold.
+3. Click **Test key** (optional) to check that embeddings and chat both work, then **Ingest**.
+4. Ask questions. Each answer shows its time, whether it came from a cache, and the retrieved chunks.
 
-Supported providers (anything speaking the OpenAI wire format works): NVIDIA NIM (free key), OpenAI, Together AI, Mistral, Groq (chat only), a local Ollama server, or any custom base URL. You can pool several free-tier keys for one provider and the app rotates to the next on rate limits.
+For NVIDIA the model dropdowns are read live from NVIDIA's model list, because its hosted lineup changes often.
 
-**Your keys stay in your browser session.** The primary key fields are masked. The optional "pool more keys" box is not, because Streamlit cannot mask a multi-line field.
+**Your key stays in your browser session.** It is masked as you type and never stored.
 
-> NVIDIA retires hosted models without notice. If a key test returns `410 Gone`, choose a current model from [build.nvidia.com/models](https://build.nvidia.com/models).
+> NVIDIA retires hosted models without notice. If something returns `410 Gone`, pick another model from the dropdown (it lists what NVIDIA serves right now).
 
 ## Run it
 
@@ -64,6 +64,6 @@ rag/
   graph_rag.py              knowledge-graph retrieval
   embedder.py               local hashing embedder and cosine similarity
   llm_client.py             OpenAI-compatible embedding and chat clients, multi-key rotation
-  providers.py              provider presets
+  providers.py              provider presets (the app offers NVIDIA and OpenAI)
   pdf_utils.py              PDF text extraction and chunking
 ```
