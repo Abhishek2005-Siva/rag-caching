@@ -1,0 +1,10 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+streamlit.log
+.DS_Store
+# Marked "CONFIDENTIAL" (a company HR policy) - keep it out of version control.
+Other-Policies.pdf
