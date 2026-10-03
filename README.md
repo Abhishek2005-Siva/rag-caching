@@ -23,10 +23,11 @@ The retrieval and caching code is plain Python with no vector database and no ML
 4. Ask questions. Each answer shows its time, whether it came from a cache, and the retrieved chunks.
 
 For NVIDIA the model dropdowns are read live from NVIDIA's model list, because its hosted lineup changes often.
+Some catalog models aren't available to every key and answer `404`. If **Test key** fails that way, click **Find working models**: it tries candidates with your key and selects ones that actually respond. The error message includes the provider's own explanation.
 
 **Your key stays in your browser session.** It is masked as you type and never stored.
 
-> NVIDIA retires hosted models without notice. If something returns `410 Gone`, pick another model from the dropdown (it lists what NVIDIA serves right now).
+> NVIDIA retires hosted models without notice (`410 Gone`) and not every catalog model is open to every key (`404`). Use **Find working models**, or pick another from the dropdown.
 
 ## Run it
 

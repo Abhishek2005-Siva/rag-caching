@@ -109,11 +109,44 @@ def nvidia_models() -> tuple[list[str], list[str]]:
         return list(_PREFERRED_CHAT), list(_PREFERRED_EMBED)
 
 
+PROBE_LIMIT = 12  # chat candidates to try; each probe is one tiny call
+
+
+def find_working_models(base_url: str, key: str, needs_input_type: bool,
+                        chat_candidates: list[str], embed_candidates: list[str]) -> dict:
+    """Try candidate models with the visitor's own key and report which ones respond.
+
+    Catalog listings include models a given account cannot actually call (HTTP 404), so the
+    only reliable test is a real one-token request."""
+    report = {"embed": None, "chat": None, "failures": []}
+    for model in embed_candidates:
+        ok, message = test_key("embed", base_url, key, model, needs_input_type)
+        if ok:
+            report["embed"] = model
+            break
+        report["failures"].append(f"embedding {model}: {message[:140]}")
+    for model in chat_candidates[:PROBE_LIMIT]:
+        ok, message = test_key("chat", base_url, key, model, needs_input_type)
+        if ok:
+            report["chat"] = model
+            break
+        report["failures"].append(f"chat {model}: {message[:140]}")
+    return report
+
+
 def connection_picker():
     """One provider, one masked API key, used for BOTH embeddings and chat.
 
     Returns (base_url, api_keys, embed_model, chat_model, needs_input_type). `api_keys` is a list
     of at most one key because the rotation helpers in rag/llm_client.py take a list."""
+    # A previous "Find working models" run chose models; apply them before the widgets are built.
+    pending = st.session_state.pop("pending_models", None)
+    if pending:
+        if pending.get("embed"):
+            st.session_state["embed_model_sel"] = pending["embed"]
+        if pending.get("chat"):
+            st.session_state["chat_model_sel"] = pending["chat"]
+
     provider_name = st.selectbox("Provider", PROVIDER_CHOICES)
     cfg = PROVIDERS[provider_name]
     base_url = cfg["base_url"]
@@ -128,8 +161,8 @@ def connection_picker():
 
     if provider_name.startswith("NVIDIA"):
         chat_models, embed_models = nvidia_models()
-        embed_model = st.selectbox("Embedding model", embed_models)
-        chat_model = st.selectbox("Chat model", chat_models)
+        embed_model = st.selectbox("Embedding model", embed_models, key="embed_model_sel")
+        chat_model = st.selectbox("Chat model", chat_models, key="chat_model_sel")
     else:
         embed_model = st.text_input("Embedding model", value=cfg["default_embed_model"])
         chat_model = st.text_input("Chat model", value=cfg["default_chat_model"])
@@ -143,6 +176,27 @@ def connection_picker():
                     st.success(f"✅ {label} work")
                 else:
                     st.error(f"❌ {label} failed: {message}")
+    if provider_name.startswith("NVIDIA"):
+        if st.button("Find working models", disabled=not api_keys,
+                     help="Some models in NVIDIA's catalog aren't available to every key (they "
+                          "return 404). This tries candidates with your key and picks ones that work."):
+            with st.spinner("Trying models with your key (this can take a few seconds)..."):
+                report = find_working_models(base_url, key, needs_input_type, chat_models, embed_models)
+            st.session_state["probe_report"] = report
+            st.session_state["pending_models"] = {"embed": report["embed"], "chat": report["chat"]}
+            st.rerun()
+        report = st.session_state.get("probe_report")
+        if report:
+            if report["embed"] and report["chat"]:
+                st.success(f"Using {report['embed']} for embeddings and {report['chat']} for chat.")
+            else:
+                missing = [n for n, m in (("embedding", report["embed"]), ("chat", report["chat"])) if not m]
+                st.error("No working " + " or ".join(missing) + " model found for this key. "
+                         "Check the key at build.nvidia.com, then try again.")
+            if report["failures"]:
+                with st.expander(f"Models that didn't work ({len(report['failures'])})"):
+                    for line in report["failures"]:
+                        st.text(line)
     return base_url, api_keys, embed_model, chat_model, needs_input_type
 
 

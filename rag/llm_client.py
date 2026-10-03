@@ -11,6 +11,18 @@ import time
 import requests
 
 
+def _check(resp: requests.Response) -> None:
+    """raise_for_status(), but keep the server's explanation in the message.
+
+    Providers say *why* in the body, e.g. NVIDIA's 404 "Function ... not found for account"
+    means the model exists in the catalog but is not available to this key."""
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as exc:
+        detail = " ".join((resp.text or "").split())[:300]
+        raise requests.HTTPError(f"{exc} | {detail}" if detail else str(exc), response=resp) from exc
+
+
 class OpenAICompatibleEmbedder:
     def __init__(self, base_url: str, api_key: str, model: str,
                  input_type: str | None = None):
@@ -33,7 +45,7 @@ class OpenAICompatibleEmbedder:
             json=payload,
             timeout=30,
         )
-        resp.raise_for_status()
+        _check(resp)
         self.last_latency_ms = (time.perf_counter() - start) * 1000
         return resp.json()["data"][0]["embedding"]
 
@@ -54,7 +66,7 @@ def chat_complete(base_url: str, api_key: str, system: str, user: str,
         },
         timeout=60,
     )
-    resp.raise_for_status()
+    _check(resp)
     return resp.json()["choices"][0]["message"]["content"]
 
 
