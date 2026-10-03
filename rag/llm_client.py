@@ -25,8 +25,9 @@ def _check(resp: requests.Response) -> None:
 
 class OpenAICompatibleEmbedder:
     def __init__(self, base_url: str, api_key: str, model: str,
-                 input_type: str | None = None):
+                 input_type: str | None = None, timeout: float = 30):
         self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
         self.api_key = api_key
         self.model = model
         self.input_type = input_type  # only providers like NVIDIA use this
@@ -43,7 +44,7 @@ class OpenAICompatibleEmbedder:
             f"{self.base_url}/embeddings",
             headers={"Authorization": f"Bearer {self.api_key}", "Accept": "application/json"},
             json=payload,
-            timeout=30,
+            timeout=self.timeout,
         )
         _check(resp)
         self.last_latency_ms = (time.perf_counter() - start) * 1000
@@ -51,7 +52,7 @@ class OpenAICompatibleEmbedder:
 
 
 def chat_complete(base_url: str, api_key: str, system: str, user: str,
-                   model: str, max_tokens: int = 512) -> str:
+                   model: str, max_tokens: int = 512, timeout: float = 60) -> str:
     resp = requests.post(
         f"{base_url.rstrip('/')}/chat/completions",
         headers={"Authorization": f"Bearer {api_key}"},
@@ -64,7 +65,7 @@ def chat_complete(base_url: str, api_key: str, system: str, user: str,
             "max_tokens": max_tokens,
             "temperature": 0.2,
         },
-        timeout=60,
+        timeout=timeout,
     )
     _check(resp)
     return resp.json()["choices"][0]["message"]["content"]

@@ -63,16 +63,18 @@ def build_index(base_url: str, api_keys: list[str], model: str, needs_input_type
     return embedder, retriever
 
 
-def test_key(role: str, base_url: str, api_key: str, model: str, needs_input_type: bool) -> tuple[bool, str]:
+def test_key(role: str, base_url: str, api_key: str, model: str, needs_input_type: bool,
+             timeout: float = 30) -> tuple[bool, str]:
     """One cheap real call to confirm a SINGLE key actually works."""
     try:
         if role == "embed":
             OpenAICompatibleEmbedder(
-                base_url, api_key, model, input_type="passage" if needs_input_type else None
+                base_url, api_key, model, input_type="passage" if needs_input_type else None,
+                timeout=timeout,
             ).embed("connection test")
         else:
             chat_complete(base_url, api_key, system="Reply with OK.", user="OK?",
-                           model=model, max_tokens=5)
+                           model=model, max_tokens=5, timeout=timeout)
         return True, "OK"
     except Exception as e:
         return False, str(e)
@@ -83,11 +85,13 @@ NVIDIA_MODELS_URL = "https://integrate.api.nvidia.com/v1/models"
 _NON_CHAT = re.compile(
     r"embed|rerank|safety|guard|reward|parse|vlm|vision|clip|retriev|riva|neva|vila|kosmos|"
     r"deplot|fuyu|video|cosmos|ising|starcoder", re.I)
-_EMBEDDING = re.compile(r"embedqa|embed-qa|arctic-embed", re.I)       # models that take input_type
-_NOT_TEXT_EMBEDDING = re.compile(r"vlm|vl-|-vl", re.I)
+_EMBEDDING = re.compile(r"embed", re.I)  # any embedding model; which ones a key can call differs per account
 _PREFERRED_CHAT = ["mistralai/mistral-large-2-instruct", "nvidia/llama-3.1-nemotron-70b-instruct",
-                   "nvidia/nemotron-nano-3-30b-a3b", "openai/gpt-oss-20b"]
-_PREFERRED_EMBED = ["nvidia/nv-embedqa-mistral-7b-v2", "nvidia/llama-3.2-nv-embedqa-1b-v1"]
+                   "nvidia/nemotron-nano-3-30b-a3b", "openai/gpt-oss-20b",
+                   "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning", "nvidia/nemotron-3-ultra-550b-a55b",
+                   "google/gemma-4-31b-it", "google/diffusiongemma-26b-a4b-it"]
+_PREFERRED_EMBED = ["nvidia/nemotron-3-embed-1b", "nvidia/nv-embedqa-mistral-7b-v2",
+                    "nvidia/llama-3.2-nv-embedqa-1b-v1", "nvidia/llama-nemotron-embed-vl-1b-v2"]
 PROVIDER_CHOICES = ["NVIDIA (build.nvidia.com)", "OpenAI"]
 
 
@@ -98,7 +102,7 @@ def nvidia_models() -> tuple[list[str], list[str]]:
         with urllib.request.urlopen(NVIDIA_MODELS_URL, timeout=8) as resp:
             ids = [m["id"] for m in json.load(resp)["data"]]
         chat = [i for i in ids if not _NON_CHAT.search(i)]
-        embed = [i for i in ids if _EMBEDDING.search(i) and not _NOT_TEXT_EMBEDDING.search(i)]
+        embed = [i for i in ids if _EMBEDDING.search(i)]
 
         def order(found, preferred):
             first = [m for m in preferred if m in found]
@@ -109,28 +113,30 @@ def nvidia_models() -> tuple[list[str], list[str]]:
         return list(_PREFERRED_CHAT), list(_PREFERRED_EMBED)
 
 
-PROBE_LIMIT = 12  # chat candidates to try; each probe is one tiny call
+PROBE_SECONDS = 60     # per role: stop looking after this long
+PROBE_TIMEOUT = 12     # a model that takes longer than this to answer a one-token call is skipped
 
 
 def find_working_models(base_url: str, key: str, needs_input_type: bool,
                         chat_candidates: list[str], embed_candidates: list[str]) -> dict:
     """Try candidate models with the visitor's own key and report which ones respond.
 
-    Catalog listings include models a given account cannot actually call (HTTP 404), so the
-    only reliable test is a real one-token request."""
+    Catalog listings include models a given account cannot call (HTTP 404), and different
+    accounts can call different models, so the only reliable test is a real one-token request.
+    A model that 404s answers in milliseconds, so trying every candidate is cheap; the time
+    budget only guards against slow or cold models."""
     report = {"embed": None, "chat": None, "failures": []}
-    for model in embed_candidates:
-        ok, message = test_key("embed", base_url, key, model, needs_input_type)
-        if ok:
-            report["embed"] = model
-            break
-        report["failures"].append(f"embedding {model}: {message[:140]}")
-    for model in chat_candidates[:PROBE_LIMIT]:
-        ok, message = test_key("chat", base_url, key, model, needs_input_type)
-        if ok:
-            report["chat"] = model
-            break
-        report["failures"].append(f"chat {model}: {message[:140]}")
+    for role, candidates in (("embed", embed_candidates), ("chat", chat_candidates)):
+        started = time.monotonic()
+        for model in candidates:
+            if time.monotonic() - started > PROBE_SECONDS:
+                report["failures"].append(f"{role}: stopped after {PROBE_SECONDS}s")
+                break
+            ok, message = test_key(role, base_url, key, model, needs_input_type, timeout=PROBE_TIMEOUT)
+            if ok:
+                report[role] = model
+                break
+            report["failures"].append(f"{'embedding' if role == 'embed' else 'chat'} {model}: {message[:140]}")
     return report
 
 
