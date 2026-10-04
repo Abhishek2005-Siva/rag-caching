@@ -9,10 +9,14 @@ Run:  .venv/bin/streamlit run app.py
 """
 import json
 import re
+import sys
 import time
 import urllib.request
+from pathlib import Path
 
 import streamlit as st
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # nvidia_picker.py lives next to this file
 
 from rag.cache import CachedEmbedder, SemanticCache
 from rag.graph_rag import KnowledgeGraph
@@ -21,6 +25,7 @@ from rag.llm_client import (
     OpenAICompatibleEmbedder, chat_complete, MultiKeyEmbedder, multi_key_chat_complete,
 )
 from rag.pdf_utils import pdf_to_documents
+from nvidia_picker import find_working_model, key_problem
 from rag.providers import PROVIDERS
 
 st.set_page_config(page_title="RAG Caching Demo", page_icon="📄", layout="wide")
@@ -113,85 +118,20 @@ def nvidia_models() -> tuple[list[str], list[str]]:
         return list(_PREFERRED_CHAT), list(_PREFERRED_EMBED)
 
 
-PROBE_SECONDS = 60     # per role: stop looking after this long
-PROBE_TIMEOUT = 12     # a model that takes longer than this to answer a one-token call is skipped
+def find_working_models(key: str, chat_candidates: list[str], embed_candidates: list[str]) -> dict:
+    """Find an embedding model and a chat model this key can actually call (shared picker).
 
-
-PROBE_PROMPT = ("Return ONLY a JSON array of facts, each an object with keys subject, relation and object, "
-                "for this text: Guy F. Cipriani resigned from the Board.")
-FAST_ENOUGH_SECONDS = 4  # stop searching once a model that returns valid JSON answers this quickly
-
-
-def probe_chat(base_url: str, key: str, model: str) -> tuple[str, float, str]:
-    """Run a miniature version of the real job (extract facts as JSON) and time it.
-
-    Returns (state, seconds, detail) where state is
-      "good"     the model returned a valid fact list,
-      "callable" the model answered but not usefully (empty, or not JSON: typical of reasoning
-                 models, which spend a small token budget thinking and say nothing),
-      "failed"   the call errored (404 not available to this key, 503 overloaded, timeout...)."""
-    started = time.monotonic()
-    try:
-        text = chat_complete(base_url, key, system="You are a precise information-extraction system.",
-                             user=PROBE_PROMPT, model=model, max_tokens=200, timeout=PROBE_TIMEOUT,
-                             retry_on_length=False, retries=1)
-    except Exception as exc:  # noqa: BLE001
-        return "failed", time.monotonic() - started, str(exc)
-    seconds = time.monotonic() - started
-    match = re.search(r"\[.*\]", text or "", re.DOTALL)
-    try:
-        facts = json.loads(match.group(0)) if match else []
-    except json.JSONDecodeError:
-        facts = []
-    good = isinstance(facts, list) and any(isinstance(f, dict) and "subject" in f for f in facts)
-    return ("good" if good else "callable"), seconds, text or "(empty reply)"
-
-
-def find_working_models(base_url: str, key: str, needs_input_type: bool,
-                        chat_candidates: list[str], embed_candidates: list[str]) -> dict:
-    """Try candidate models with the visitor's own key and report which ones work well.
-
-    Catalog listings include models a given account cannot call (HTTP 404), different accounts
-    can call different models, and free endpoints are sometimes overloaded (503). So the only
-    reliable test is a real request. For chat the request is a miniature fact extraction, and the
-    fastest model that returns valid JSON wins: reasoning models can take a minute per answer,
-    which made knowledge-graph builds time out. A model that 404s answers in milliseconds, so
-    trying every candidate is cheap; the time budget only guards against slow or cold models."""
-    report = {"embed": None, "chat": None, "chat_quality": None, "chat_seconds": None, "failures": []}
-
-    started = time.monotonic()
-    for model in embed_candidates:
-        if time.monotonic() - started > PROBE_SECONDS:
-            report["failures"].append(f"embedding: stopped after {PROBE_SECONDS}s")
-            break
-        ok, message = test_key("embed", base_url, key, model, needs_input_type, timeout=PROBE_TIMEOUT)
-        if ok:
-            report["embed"] = model
-            break
-        report["failures"].append(f"embedding {model}: {message[:140]}")
-
-    started = time.monotonic()
-    good, callable_only = [], []  # (seconds, model)
-    for model in chat_candidates:
-        if time.monotonic() - started > PROBE_SECONDS or len(good) >= 3:
-            break
-        state, seconds, detail = probe_chat(base_url, key, model)
-        if state == "failed":
-            report["failures"].append(f"chat {model}: {detail[:140]}")
-        elif state == "good":
-            good.append((seconds, model))
-            if seconds <= FAST_ENOUGH_SECONDS:
-                break
-        else:
-            callable_only.append((seconds, model))
-            report["failures"].append(f"chat {model}: answered but not usefully ({seconds:.0f}s): {detail[:80]!r}")
-    if good:
-        seconds, report["chat"] = min(good)
-        report["chat_quality"], report["chat_seconds"] = "good", seconds
-    elif callable_only:
-        seconds, report["chat"] = min(callable_only)
-        report["chat_quality"], report["chat_seconds"] = "untested", seconds
-    return report
+    NVIDIA's catalog lists models some keys cannot call (404) and it differs from key to key, so
+    each model is tried for real, in parallel, and the fastest good one is used."""
+    embed = find_working_model(key, embed_candidates, kind="embed")
+    chat = find_working_model(key, chat_candidates, kind="chat")
+    return {
+        "embed": embed["model"], "chat": chat["model"], "chat_quality": chat["quality"],
+        "failures": ([f"embedding {m}: {d}" for m, d in embed["failures"]]
+                     + [f"chat {m}: {d}" for m, d in chat["failures"]]),
+        "diagnosis": [d for d in (None if embed["model"] else "Embeddings: " + embed["diagnosis"],
+                                  None if chat["model"] else "Chat: " + chat["diagnosis"]) if d],
+    }
 
 
 def connection_picker():
@@ -217,6 +157,8 @@ def connection_picker():
     ).strip()
     if cfg["signup_url"]:
         st.caption(f"Get a free key: {cfg['signup_url']}")
+    if provider_name.startswith("NVIDIA") and key_problem(key):
+        st.warning(key_problem(key))
     api_keys = [key] if key else []
 
     if provider_name.startswith("NVIDIA"):
@@ -240,8 +182,8 @@ def connection_picker():
         if st.button("Find working models", disabled=not api_keys,
                      help="Some models in NVIDIA's catalog aren't available to every key (they "
                           "return 404). This tries candidates with your key and picks ones that work."):
-            with st.spinner("Trying models with your key (this can take a few seconds)..."):
-                report = find_working_models(base_url, key, needs_input_type, chat_models, embed_models)
+            with st.spinner("Trying models with your key (up to ~40 seconds)..."):
+                report = find_working_models(key, chat_models, embed_models)
             st.session_state["probe_report"] = report
             st.session_state["pending_models"] = {"embed": report["embed"], "chat": report["chat"]}
             st.rerun()
@@ -250,13 +192,12 @@ def connection_picker():
             if report["embed"] and report["chat"]:
                 st.success(f"Using {report['embed']} for embeddings and {report['chat']} for chat.")
                 if report["chat_quality"] == "untested":
-                    st.warning("That chat model responds but did not pass a small fact-extraction test "
-                               "(it may be a slow reasoning model), so answers and the knowledge graph may "
-                               "be slow or fail. No better model was available to this key right now.")
+                    st.warning("That chat model responds but returned little text (it may be a slow reasoning "
+                               "model), so answers and the knowledge graph may be slow or fail. No better "
+                               "model was available to this key right now.")
             else:
-                missing = [n for n, m in (("embedding", report["embed"]), ("chat", report["chat"])) if not m]
-                st.error("No working " + " or ".join(missing) + " model found for this key. "
-                         "Check the key at build.nvidia.com, then try again.")
+                for reason in report["diagnosis"]:
+                    st.error(reason)
             if report["failures"]:
                 with st.expander(f"Models that didn't work ({len(report['failures'])})"):
                     for line in report["failures"]:
